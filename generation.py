@@ -26,6 +26,7 @@ from providers import (
     LLMAuthError,
     LLMConfigError,
     LLMError,
+    LLMResponseCorrectionError,
     LLMTransientError,
     create_provider,
 )
@@ -96,6 +97,9 @@ class GenerationService:
 
         parsed_card, violations = self._try_parse(raw_output)
 
+        if parsed_card.insufficient_data_reason:
+            return parsed_card, total_attempts
+
         # Ровно одна корректирующая попытка при нарушении схемы или ограничений длины
         if violations:
             logger.warning(
@@ -104,7 +108,12 @@ class GenerationService:
                 config.model,
                 violations,
             )
-            corrective_prompt = build_corrective_prompt(raw_output, violations)
+            corrective_prompt = build_corrective_prompt(
+                cleaned_input=cleaned_input,
+                schema=CARD_RESPONSE_SCHEMA,
+                previous_output=raw_output,
+                violations=violations,
+            )
             corr_output, corr_attempts = provider.generate(
                 prompt=corrective_prompt,
                 system_prompt=SYSTEM_PROMPT,
@@ -114,7 +123,9 @@ class GenerationService:
             total_attempts += corr_attempts
             parsed_card, corr_violations = self._try_parse(corr_output)
             if corr_violations:
-                raise LLMError(f"Модель вернула результат, не соответствующий требованиям: {'; '.join(corr_violations)}")
+                raise LLMResponseCorrectionError(
+                    f"Модель вернула результат, не соответствующий требованиям: {'; '.join(corr_violations)}"
+                )
 
         return parsed_card, total_attempts
 
@@ -162,23 +173,30 @@ class GenerationService:
             return None, "Генерация заблокирована из-за ошибок во входных данных."
 
         active_config = self.config.primary
-        active_provider = create_provider(active_config)
+        try:
+            active_provider = create_provider(active_config)
+        except (LLMConfigError, LLMAuthError) as err:
+            logger.error("Ошибка инициализации основного провайдера: %s", err)
+            return None, str(err)
+        except Exception as err:
+            logger.error("Непредвиденная ошибка создания основного провайдера: %s", err)
+            return None, f"Не удалось инициализировать основной провайдер: {err}"
+
+        fallback_provider: BaseLLMProvider | None = None
         used_fallback = False
-        total_attempts = 0
 
         logger.info("Старт генерации: провайдер=%s, модель=%s", active_config.provider, active_config.model)
 
         generated_card: LLMGeneratedCard | None = None
 
         try:
-            generated_card, attempts = self._call_and_validate(
+            generated_card, _ = self._call_and_validate(
                 active_provider, active_config, validation_result.cleaned_input
             )
-            total_attempts += attempts
         except (LLMAuthError, LLMConfigError) as err:
             logger.error("Критическая ошибка конфигурации/авторизации основного маршрута: %s", err)
             return None, str(err)
-        except Exception as primary_err:
+        except (LLMTransientError, LLMResponseCorrectionError) as primary_err:
             logger.warning("Сбой основного маршрута (%s): %s", active_config.model, primary_err)
 
             # Проверка возможности переключения на fallback
@@ -190,17 +208,27 @@ class GenerationService:
                 )
                 used_fallback = True
                 active_config = self.config.fallback
-                fallback_provider = create_provider(active_config)
                 try:
-                    generated_card, fb_attempts = self._call_and_validate(
+                    fallback_provider = create_provider(active_config)
+                except (LLMConfigError, LLMAuthError) as fb_init_err:
+                    logger.error("Ошибка инициализации резервного провайдера: %s", fb_init_err)
+                    return None, f"Ошибка инициализации резервного провайдера: {fb_init_err}"
+                except Exception as fb_init_err:
+                    logger.error("Непредвиденная ошибка создания резервного провайдера: %s", fb_init_err)
+                    return None, f"Не удалось инициализировать резервный провайдер: {fb_init_err}"
+
+                try:
+                    generated_card, _ = self._call_and_validate(
                         fallback_provider, active_config, validation_result.cleaned_input
                     )
-                    total_attempts += fb_attempts
                 except Exception as fb_err:
                     logger.error("Сбой резервного маршрута: %s", fb_err)
                     return None, f"Основной и резервный маршруты завершились ошибкой: {fb_err}"
             else:
                 return None, f"Не удалось получить ответ сервиса: {primary_err}"
+        except Exception as unexpected_err:
+            logger.error("Непредвиденная программная ошибка основного маршрута: %s", unexpected_err, exc_info=True)
+            return None, f"Внутренняя программная ошибка: {unexpected_err}"
 
         duration = round(time.perf_counter() - start_time, 2)
 
@@ -225,12 +253,18 @@ class GenerationService:
 
         card_status = "needs_review" if all_warnings else "ready"
 
+        primary_requests = active_provider.request_count
+        fallback_requests = fallback_provider.request_count if (used_fallback and fallback_provider) else 0
+        total_requests = primary_requests + fallback_requests
+        retries_count = max(0, total_requests - 1)
+
         metadata = ExportMetadata(
             provider=active_config.provider,
             model=active_config.model,
             generation_timestamp=datetime.now(timezone.utc).isoformat(),
             fallback_used=used_fallback,
-            retries_count=max(0, total_attempts - 1),
+            retries_count=retries_count,
+            total_requests=total_requests,
             duration_seconds=duration,
         )
 
@@ -242,10 +276,11 @@ class GenerationService:
         )
 
         logger.info(
-            "Генерация завершена за %.2fc. Статус=%s, fallback=%s, попыток=%d",
+            "Генерация завершена за %.2fc. Статус=%s, fallback=%s, запросов=%d (повторов=%d)",
             duration,
             card_status,
             used_fallback,
-            total_attempts,
+            total_requests,
+            retries_count,
         )
         return payload, None

@@ -90,6 +90,7 @@ class ExportMetadata(BaseModel):
     generation_timestamp: str
     fallback_used: bool = False
     retries_count: int = 0
+    total_requests: int = 1
     duration_seconds: float = 0.0
 
 

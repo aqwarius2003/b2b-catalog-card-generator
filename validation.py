@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
-from models import ProductInput, SpecItem, ValidationResult, ValidationStatus
-
-DEFAULT_PROFILES_PATH = Path(__file__).resolve().parent / "category_profiles.json"
+from models import SpecItem, ValidationResult, ValidationStatus
 
 
 def parse_json_reject_duplicates(raw_text: str) -> dict[str, Any]:
     def _pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
+        seen_stripped: set[str] = set()
         for key, val in pairs:
             if key in result:
                 raise ValueError(f"Обнаружен дублирующийся ключ в JSON: '{key}'")
+            clean_key = key.strip()
+            if clean_key in seen_stripped:
+                raise ValueError(f"Обнаружен дублирующийся ключ после удаления пробелов в JSON: '{clean_key}'")
+            seen_stripped.add(clean_key)
             result[key] = val
         return result
 
@@ -28,19 +30,45 @@ def parse_json_reject_duplicates(raw_text: str) -> dict[str, Any]:
     return data
 
 
-def load_category_profiles(path: Path | str | None = None) -> dict[str, Any]:
-    file_path = Path(path) if path else DEFAULT_PROFILES_PATH
-    if not file_path.exists():
-        return {}
-    with open(file_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def validate_manual_specs_table(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    """
+    Проверяет строки ручной таблицы характеристик до преобразования в словарь.
+    - Пустую строку (без названия и значения) игнорирует.
+    - Строку со значением, но без названия, отмечает как ошибку.
+    - Повторяющиеся названия строк отклоняет с понятной ошибкой.
+    """
+    specs_dict: dict[str, Any] = {}
+    errors: list[str] = []
+    seen_names: set[str] = set()
+
+    for idx, row in enumerate(rows, start=1):
+        k = row.get("Характеристика")
+        v = row.get("Значение")
+
+        k_str = "" if k is None else str(k).strip()
+        v_str = "" if v is None else str(v).strip()
+
+        # Пустая строка без названия и значения игнорируется
+        if not k_str and not v_str:
+            continue
+
+        # Значение указано, но название пустое
+        if not k_str and v_str:
+            errors.append(f"Строка {idx}: указано значение '{v_str}', но название характеристики не заполнено.")
+            continue
+
+        # Проверка дубликатов названий
+        if k_str in seen_names:
+            errors.append(f"Строка {idx}: обнаружено дублирование характеристики '{k_str}'.")
+            continue
+
+        seen_names.add(k_str)
+        specs_dict[k_str] = v_str if v_str else None
+
+    return specs_dict, errors
 
 
-def validate_product_input(
-    raw_data: dict[str, Any] | str,
-    category_key: str | None = None,
-    profiles_path: Path | str | None = None,
-) -> ValidationResult:
+def validate_product_input(raw_data: dict[str, Any] | str) -> ValidationResult:
     warnings: list[str] = []
     errors: list[str] = []
 
@@ -103,11 +131,16 @@ def validate_product_input(
     elif not isinstance(specs_raw, dict):
         errors.append("Поле 'specs' должно содержать объект характеристик.")
     else:
+        seen_clean_keys: set[str] = set()
         for k, v in specs_raw.items():
             if not isinstance(k, str) or not k.strip():
                 errors.append(f"Название характеристики должно быть непустой строкой, получено: {k!r}")
                 continue
             clean_k = k.strip()
+            if clean_k in seen_clean_keys:
+                errors.append(f"Обнаружено дублирование характеристики после удаления пробелов: '{clean_k}'.")
+                continue
+            seen_clean_keys.add(clean_k)
 
             if v is None:
                 clean_specs[clean_k] = "данных нет"
@@ -155,49 +188,8 @@ def validate_product_input(
             errors=errors,
         )
 
-    # 7. Формирование списка характеристик и сверка с профилем категории
-    profiles = load_category_profiles(profiles_path)
-    specs_list: list[SpecItem] = []
-
-    if category_key and category_key in profiles:
-        cat_info = profiles[category_key]
-        expected_items = cat_info.get("expected_specs", [])
-
-        # Индексируем переданные характеристики по нормализованному ключу для быстрого поиска
-        provided_normalized = {k.lower(): (k, v) for k, v in clean_specs.items()}
-        matched_input_keys: set[str] = set()
-
-        for expected in expected_items:
-            canonical_name = expected["canonical_name"]
-            aliases = [canonical_name.lower()] + [a.lower() for a in expected.get("aliases", [])]
-
-            found_key: str | None = None
-            found_val: str | None = None
-
-            for alias in aliases:
-                if alias in provided_normalized:
-                    orig_k, val = provided_normalized[alias]
-                    found_key = orig_k
-                    found_val = val
-                    matched_input_keys.add(orig_k)
-                    break
-
-            if found_key is not None and found_val is not None:
-                specs_list.append(SpecItem(name=canonical_name, value=found_val))
-                if found_val == "данных нет":
-                    warnings.append(f"В категории '{cat_info.get('title')}' характеристика '{canonical_name}' не имеет значения.")
-            else:
-                specs_list.append(SpecItem(name=canonical_name, value="данных нет"))
-                warnings.append(f"В категории '{cat_info.get('title')}' отсутствует ожидаемая характеристика: '{canonical_name}'.")
-
-        # Добавляем все остальные переданные характеристики, не вошедшие в профиль
-        for k, v in clean_specs.items():
-            if k not in matched_input_keys:
-                specs_list.append(SpecItem(name=k, value=v))
-    else:
-        # Без категории — сохраняем все переданные характеристики
-        for k, v in clean_specs.items():
-            specs_list.append(SpecItem(name=k, value=v))
+    # 7. Формирование структурированного списка характеристик программно из входа
+    specs_list: list[SpecItem] = [SpecItem(name=k, value=v) for k, v in clean_specs.items()]
 
     cleaned_input = {
         "name": clean_name,

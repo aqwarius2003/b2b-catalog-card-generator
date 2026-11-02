@@ -5,6 +5,7 @@ import pytest
 from models import ValidationStatus
 from validation import (
     parse_json_reject_duplicates,
+    validate_manual_specs_table,
     validate_product_input,
 )
 
@@ -112,22 +113,75 @@ def test_validate_insufficient_data():
     assert any("Недостаточно данных" in e for e in result.errors)
 
 
-def test_validate_category_expected_specs():
+def test_validate_missing_spec_key_not_added_and_not_error():
+    # Если характеристика не передана, она не должна добавляться в список и не считается ошибкой
     data = {
         "name": "Манометр ТМ-510",
         "manufacturer": "Физтех",
-        "specs": {"шкала": "0–1,6 МПа", "точность": "1,5"},
+        "specs": {"шкала": "0–1,6 МПа"},
         "description": "Описание манометра",
     }
-    result = validate_product_input(data, category_key="pressure_gauges")
-    assert result.status == ValidationStatus.NEEDS_REVIEW
-    specs_dict = {item.name: item.value for item in result.specs_list}
+    result = validate_product_input(data)
+    assert result.status == ValidationStatus.VALID
+    assert len(result.specs_list) == 1
+    assert result.specs_list[0].name == "шкала"
+    assert result.specs_list[0].value == "0–1,6 МПа"
+    assert len(result.warnings) == 0
 
-    # Синонимы должны быть сопоставлены каноническим именам
-    assert specs_dict["Диапазон измерений"] == "0–1,6 МПа"
-    assert specs_dict["Класс точности"] == "1,5"
 
-    # Отсутствующие ожидаемые характеристики должны стать "данных нет"
-    assert specs_dict["Диаметр корпуса"] == "данных нет"
-    assert specs_dict["Присоединительная резьба"] == "данных нет"
-    assert any("Диаметр корпуса" in w for w in result.warnings)
+def test_validate_duplicate_keys_after_strip_in_json():
+    raw_json = json.dumps({
+        "name": "Манометр",
+        "manufacturer": "Физтех",
+        "specs": {
+            "диапазон": "0–10",
+            " диапазон ": "0–20",
+        },
+        "description": "Описание",
+    }, ensure_ascii=False)
+    result = validate_product_input(raw_json)
+    assert result.status == ValidationStatus.ERROR
+    assert any("дублирующийся ключ" in e.lower() for e in result.errors)
+
+
+def test_validate_duplicate_keys_after_strip_in_dict():
+    data = {
+        "name": "Манометр",
+        "manufacturer": "Физтех",
+        "specs": {
+            "диапазон": "0–10",
+            " диапазон ": "0–20",
+        },
+        "description": "Описание",
+    }
+    result = validate_product_input(data)
+    assert result.status == ValidationStatus.ERROR
+    assert any("дублирование характеристики после удаления пробелов" in e for e in result.errors)
+
+
+def test_validate_manual_specs_table():
+    rows = [
+        {"Характеристика": "  ", "Значение": "   "},  # Пустая строка -> игнорируется
+        {"Характеристика": "Диапазон", "Значение": "0-10"},
+        {"Характеристика": "Класс", "Значение": ""},  # Пустое значение -> разрешено, будет None
+    ]
+    specs, errors = validate_manual_specs_table(rows)
+    assert len(errors) == 0
+    assert specs == {"Диапазон": "0-10", "Класс": None}
+
+    # Значение без названия
+    rows_val_without_name = [
+        {"Характеристика": "", "Значение": "0-10"},
+    ]
+    _, errs1 = validate_manual_specs_table(rows_val_without_name)
+    assert len(errs1) == 1
+    assert "название характеристики не заполнено" in errs1[0]
+
+    # Дублирование названий строк
+    rows_duplicate = [
+        {"Характеристика": "Диапазон", "Значение": "0-10"},
+        {"Характеристика": " Диапазон ", "Значение": "0-20"},
+    ]
+    _, errs2 = validate_manual_specs_table(rows_duplicate)
+    assert len(errs2) == 1
+    assert "дублирование характеристики" in errs2[0]

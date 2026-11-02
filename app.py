@@ -6,9 +6,10 @@ from typing import Any
 import streamlit as st
 
 from config import AppConfig
+from formatting import format_markdown_export
 from generation import GenerationService
-from models import ExportPayload, SpecItem, ValidationResult, ValidationStatus
-from validation import load_category_profiles, validate_product_input
+from models import ExportPayload, ValidationResult, ValidationStatus
+from validation import validate_manual_specs_table, validate_product_input
 
 st.set_page_config(
     page_title="AI-помощник товарных карточек B2B",
@@ -28,183 +29,219 @@ def init_session_state() -> None:
         st.session_state.card_payload = None
     if "generation_error" not in st.session_state:
         st.session_state.generation_error = None
+    if "specs_version" not in st.session_state:
+        st.session_state.specs_version = 0
     if "manual_specs" not in st.session_state:
         st.session_state.manual_specs = [
             {"Характеристика": "Диапазон измерений", "Значение": "0–1,6 МПа"},
             {"Характеристика": "Класс точности", "Значение": "1,5"},
         ]
-    if "input_name" not in st.session_state:
-        st.session_state.input_name = ""
-    if "input_mfr" not in st.session_state:
-        st.session_state.input_mfr = ""
-    if "input_desc" not in st.session_state:
-        st.session_state.input_desc = ""
-    if "json_input_text" not in st.session_state:
-        st.session_state.json_input_text = ""
-    if "allow_incomplete" not in st.session_state:
-        st.session_state.allow_incomplete = False
+    if "w_name" not in st.session_state:
+        st.session_state.w_name = ""
+    if "w_mfr" not in st.session_state:
+        st.session_state.w_mfr = ""
+    if "w_desc" not in st.session_state:
+        st.session_state.w_desc = ""
+    if "w_json_area" not in st.session_state:
+        st.session_state.w_json_area = ""
+    if "w_allow_incomplete" not in st.session_state:
+        st.session_state.w_allow_incomplete = False
 
 
-def load_example(example_name: str) -> None:
-    path = EXAMPLES_DIR / f"{example_name}.input.json"
-    if not path.exists():
-        return
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    st.session_state.input_name = data.get("name", "")
-    st.session_state.input_mfr = data.get("manufacturer", "")
-    st.session_state.input_desc = data.get("description", "")
-    st.session_state.json_input_text = json.dumps(data, ensure_ascii=False, indent=2)
+def load_example_data(data: dict[str, Any]) -> None:
+    st.session_state.w_name = data.get("name", "")
+    st.session_state.w_mfr = data.get("manufacturer", "")
+    st.session_state.w_desc = data.get("description", "")
+    st.session_state.w_json_area = json.dumps(data, ensure_ascii=False, indent=2)
 
     specs = data.get("specs") or {}
     st.session_state.manual_specs = [
         {"Характеристика": str(k), "Значение": "" if v is None else str(v)}
         for k, v in specs.items()
     ]
-    st.session_state.allow_incomplete = False
+    st.session_state.specs_version += 1
+    st.session_state.w_allow_incomplete = False
     st.session_state.card_payload = None
     st.session_state.generation_error = None
+    st.session_state.last_generated_hash = ""
+    st.session_state.input_hash = ""
 
 
-def format_markdown_export(payload: ExportPayload) -> str:
-    card = payload.card
-    meta = payload.metadata
-    lines: list[str] = [
-        f"# Черновик товарной карточки: {card.seo_title}",
-        "",
-        "> **Черновик — проверьте перед публикацией**",
-        "",
-        f"**Статус проверки:** `{payload.status}`  ",
-        f"**Дата генерации:** `{meta.generation_timestamp}`  ",
-        f"**Модель:** `{meta.provider} / {meta.model}` (повторов: {meta.retries_count}, время: {meta.duration_seconds}c)  ",
+def get_example_items() -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if not EXAMPLES_DIR.exists():
+        return items
+
+    for file_path in sorted(EXAMPLES_DIR.glob("*.json")):
+        if file_path.name.endswith(".output.json"):
+            continue
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "name" in data:
+                items.append({
+                    "file_path": file_path,
+                    "filename": file_path.name,
+                    "name": str(data.get("name", "")).strip(),
+                    "data": data,
+                })
+        except Exception:
+            continue
+    return items
+
+
+def format_button_label(filename: str, name: str, max_chars_per_line: int = 34) -> str:
+    import textwrap
+
+    short_fn = filename if len(filename) <= 28 else filename[:25] + "..."
+    clean_name = name.strip() or "Без названия"
+    lines = textwrap.wrap(clean_name, width=max_chars_per_line)
+    if len(lines) == 1:
+        title_lines = lines[0]
+    elif len(lines) == 2:
+        title_lines = f"{lines[0]}\n{lines[1]}"
+    else:
+        second_line = lines[1]
+        if len(second_line) > max_chars_per_line - 3:
+            second_line = second_line[:max_chars_per_line - 3] + "..."
+        else:
+            second_line = second_line + "..."
+        title_lines = f"{lines[0]}\n{second_line}"
+
+    return f"📄 {short_fn}\n{title_lines}"
+
+
+def clear_form() -> None:
+    st.session_state.w_name = ""
+    st.session_state.w_mfr = ""
+    st.session_state.w_desc = ""
+    st.session_state.w_json_area = ""
+    st.session_state.manual_specs = [
+        {"Характеристика": "", "Значение": ""},
     ]
-
-    if meta.fallback_used:
-        lines.append("> ⚠️ **Внимание:** Использован резервный маршрут (fallback).")
-
-    lines.extend([
-        "",
-        "## 1. SEO-заголовок",
-        card.seo_title,
-        "",
-        f"## 2. SEO-описание ({len(card.seo_description)} знаков с пробелами)",
-        card.seo_description,
-        "",
-        "## 3. Характеристики",
-        "| Характеристика | Значение |",
-        "|---|---|",
-    ])
-
-    for spec in card.specs_list:
-        lines.append(f"| {spec.name} | {spec.value} |")
-
-    lines.extend([
-        "",
-        "## 4. Поисковые B2B-запросы",
-    ])
-    for q in card.search_queries:
-        lines.append(f"- {q}")
-
-    lines.extend([
-        "",
-        "## 5. Commercial-блок",
-        card.commercial_block,
-    ])
-
-    if payload.warnings:
-        lines.extend(["", "## Предупреждения"])
-        for w in payload.warnings:
-            lines.append(f"- ⚠️ {w}")
-
-    return "\n".join(lines)
+    st.session_state.specs_version += 1
+    st.session_state.w_allow_incomplete = False
+    st.session_state.card_payload = None
+    st.session_state.generation_error = None
+    st.session_state.last_generated_hash = ""
+    st.session_state.input_hash = ""
 
 
 def main() -> None:
     init_session_state()
 
-    st.title("⚙️ AI-помощник товарных карточек B2B")
-    st.info("📌 **Черновик — проверьте перед публикацией.** Результат генерации требует обязательной верификации контент-менеджером.")
+    st.header("⚙️ AI-помощник товарных карточек B2B")
 
     config = AppConfig.from_env()
     config_errors = config.validate()
 
-    profiles = load_category_profiles()
-    cat_options = {"none": "Без категории / Другое"}
-    for k, v in profiles.items():
-        cat_options[k] = v.get("title", k)
-
     # Боковая панель
     with st.sidebar:
-        st.header("Конфигурация")
-        st.markdown(f"**Основной маршрут:** `{config.primary.provider}`")
-        st.markdown(f"**Модель:** `{config.primary.model or 'не указана'}`")
-        st.markdown(f"**Режим вывода:** `{config.primary.output_mode}`")
+        st.warning(
+            "📌 **Черновик — проверьте перед публикацией.**\n\n"
+            "Результат генерации требует обязательной верификации контент-менеджером."
+        )
 
-        if config.fallback_enabled and config.fallback:
-            st.markdown(f"**Fallback маршрут:** `{config.fallback.provider} ({config.fallback.model})`")
+        if st.button("🗑️ Очистить форму", width="stretch"):
+            clear_form()
+            st.rerun()
+
+        st.divider()
+
+        st.subheader("Тестовые примеры")
+
+        st.html("""
+        <style>
+        [data-testid="stSidebar"] div.stButton > button {
+            font-size: 0.8rem !important;
+            line-height: 1.3 !important;
+            padding: 0.4rem 0.6rem !important;
+            text-align: left !important;
+            white-space: pre-wrap !important;
+            justify-content: flex-start !important;
+        }
+        </style>
+        """)
+
+        example_items = get_example_items()
+        if not example_items:
+            st.caption("В папке examples нет JSON-файлов.")
         else:
-            st.caption("Fallback маршрут: отключен")
+            for item in example_items:
+                btn_label = format_button_label(item["filename"], item["name"])
+                if st.button(
+                    btn_label,
+                    key=f"btn_ex_{item['filename']}",
+                    help=item["name"],
+                    width="stretch",
+                ):
+                    load_example_data(item["data"])
+                    st.rerun()
+
+        st.divider()
+
+        st.caption("⚙️ **Конфигурация**")
+        st.caption(
+            f"**Основной маршрут:** `{config.primary.provider}`  \n"
+            f"**Модель:** `{config.primary.model or 'не указана'}`  \n"
+            f"**Режим вывода:** `{config.primary.output_mode}`  \n"
+            f"**Fallback маршрут:** `{config.fallback.provider if (config.fallback_enabled and config.fallback) else 'отключен'}`"
+        )
 
         if config_errors:
             st.error("Ошибка конфигурации .env:\n" + "\n".join(f"- {e}" for e in config_errors))
 
-        st.divider()
-        st.subheader("Тестовые примеры")
-        col_ex1, col_ex2 = st.columns(2)
-        with col_ex1:
-            if st.button("Товар 1 (Манометр)", use_container_width=True):
-                load_example("product_1")
-                st.rerun()
-        with col_ex2:
-            if st.button("Товар 2 (Датчик)", use_container_width=True):
-                load_example("product_2")
-                st.rerun()
-
-    # Выбор категории
-    selected_cat_key = st.selectbox(
-        "Категория оборудования для проверки полноты характеристик:",
-        options=list(cat_options.keys()),
-        format_func=lambda x: cat_options[x],
+    # Выбор способа ввода данных
+    input_mode = st.segmented_control(
+        "Способ ввода данных:",
+        options=["📝 Ручной ввод", "📄 Ввод через JSON"],
+        default="📝 Ручной ввод",
+        key="w_input_mode",
     )
-    active_cat = None if selected_cat_key == "none" else selected_cat_key
 
-    # Ввод данных: Ручной или JSON
-    tab_manual, tab_json = st.tabs(["📝 Ручной ввод", "📄 Ввод через JSON"])
-    current_input_data: dict[str, Any] = {}
+    manual_table_errors: list[str] = []
 
-    with tab_manual:
+    if input_mode == "📄 Ввод через JSON":
+        uploaded_file = st.file_uploader("Загрузить файл .json", type=["json"])
+        if uploaded_file is not None:
+            try:
+                uploaded_content = uploaded_file.read().decode("utf-8")
+                st.session_state.w_json_area = uploaded_content
+            except Exception as err:
+                st.error(f"Ошибка чтения файла: {err}")
+
+        json_val = st.text_area(
+            "Вставьте JSON-структуру товара:",
+            height=240,
+            key="w_json_area",
+        )
+        raw_payload_to_validate = json_val
+    else:
         col_m1, col_m2 = st.columns(2)
         with col_m1:
-            name_val = st.text_input("Название прибора*", value=st.session_state.input_name, key="w_name")
+            name_val = st.text_input("Название прибора*", key="w_name")
         with col_m2:
-            mfr_val = st.text_input("Производитель*", value=st.session_state.input_mfr, key="w_mfr")
+            mfr_val = st.text_input("Производитель*", key="w_mfr")
 
         st.caption("Характеристики (редактируйте таблицу или добавляйте новые строки):")
         edited_specs = st.data_editor(
             st.session_state.manual_specs,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "Характеристика": st.column_config.TextColumn(required=True),
                 "Значение": st.column_config.TextColumn(),
             },
-            key="w_specs_editor",
+            key=f"w_specs_editor_{st.session_state.specs_version}",
         )
 
         desc_val = st.text_area(
             "Исходное описание или фрагмент паспорта:",
-            value=st.session_state.input_desc,
             height=120,
             key="w_desc",
         )
 
-        specs_dict: dict[str, Any] = {}
-        for row in edited_specs:
-            k = row.get("Характеристика")
-            v = row.get("Значение")
-            if k and str(k).strip():
-                specs_dict[str(k).strip()] = None if v is None or not str(v).strip() else str(v).strip()
+        specs_dict, manual_table_errors = validate_manual_specs_table(edited_specs)
 
         manual_data = {
             "name": name_val,
@@ -212,40 +249,26 @@ def main() -> None:
             "specs": specs_dict,
             "description": desc_val,
         }
-
-    with tab_json:
-        uploaded_file = st.file_uploader("Загрузить файл .json", type=["json"])
-        if uploaded_file is not None:
-            try:
-                uploaded_content = uploaded_file.read().decode("utf-8")
-                st.session_state.json_input_text = uploaded_content
-            except Exception as err:
-                st.error(f"Ошибка чтения файла: {err}")
-
-        json_val = st.text_area(
-            "Вставьте JSON-структуру товара:",
-            value=st.session_state.json_input_text,
-            height=240,
-            key="w_json_area",
-        )
-
-    # Определяем активный источник ввода
-    # Если на вкладке JSON не пусто и отличается от ручного, используем его, иначе ручной
-    use_json_tab = bool(json_val.strip()) and (tab_json == st.session_state.get("_active_tab"))
-    # Для однозначности в Streamlit смотрим на вкладку или ручной ввод
-    raw_payload_to_validate: Any = json_val if json_val.strip() else manual_data
+        raw_payload_to_validate = manual_data
 
     # Выполняем предварительную валидацию
-    val_result: ValidationResult = validate_product_input(
-        raw_payload_to_validate,
-        category_key=active_cat,
-    )
+    val_result: ValidationResult = validate_product_input(raw_payload_to_validate)
+
+    # Объединяем ошибки валидации ручной таблицы со списком ошибок валидации
+    if manual_table_errors:
+        val_result = ValidationResult(
+            status=ValidationStatus.ERROR,
+            cleaned_input=val_result.cleaned_input,
+            specs_list=val_result.specs_list,
+            warnings=val_result.warnings,
+            errors=manual_table_errors + val_result.errors,
+        )
 
     # Отслеживаем изменение входных данных для сброса подтверждения
-    curr_hash = f"{raw_payload_to_validate}_{active_cat}"
+    curr_hash = f"{raw_payload_to_validate}_{input_mode}"
     if curr_hash != st.session_state.input_hash:
         st.session_state.input_hash = curr_hash
-        st.session_state.allow_incomplete = False
+        st.session_state.w_allow_incomplete = False
 
     st.subheader("Проверка готовности данных")
 
@@ -266,26 +289,30 @@ def main() -> None:
         can_generate = False
     elif val_result.requires_confirmation:
         allow_inc = st.checkbox(
-            "Продолжить с неполными данными. Отсутствующие характеристики будут отмечены как «данных нет».",
-            value=st.session_state.allow_incomplete,
+            "Продолжить с неполными данными. Неполные характеристики будут отмечены как «данных нет».",
             key="w_allow_incomplete",
         )
-        st.session_state.allow_incomplete = allow_inc
         can_generate = allow_inc
     else:
         can_generate = True
 
-    # Кнопка явного запуска генерации
+    # Кнопки запуска генерации и сброса
     gen_btn_disabled = not can_generate or bool(config_errors)
     btn_text = "Сгенерировать черновик карточки"
 
-    if st.button(btn_text, disabled=gen_btn_disabled, type="primary"):
-        with st.spinner("Генерация карточки товара через LLM..."):
-            service = GenerationService(config)
-            payload, err = service.generate_card(val_result)
-            st.session_state.card_payload = payload
-            st.session_state.generation_error = err
-            st.session_state.last_generated_hash = curr_hash
+    col_btn1, col_btn2 = st.columns([3, 1], vertical_alignment="center")
+    with col_btn1:
+        if st.button(btn_text, disabled=gen_btn_disabled, type="primary", width="stretch"):
+            with st.spinner("Генерация карточки товара через LLM..."):
+                service = GenerationService(config)
+                payload, err = service.generate_card(val_result)
+                st.session_state.card_payload = payload
+                st.session_state.generation_error = err
+                st.session_state.last_generated_hash = curr_hash
+    with col_btn2:
+        if st.button("Сбросить ввод", width="stretch", help="Очистить поля формы"):
+            clear_form()
+            st.rerun()
 
     # Вывод сообщения об ошибке генерации, если была
     if st.session_state.generation_error:
@@ -306,27 +333,40 @@ def main() -> None:
 
         col_st1, col_st2, col_st3 = st.columns(3)
         col_st1.metric("Статус карточки", card_payload.status.upper())
-        col_st2.metric("Символов в SEO-описании", len(card.seo_description))
+        desc_len = len(card.seo_description)
+        is_desc_ok = 800 <= desc_len <= 1200
+        col_st2.metric(
+            "Символов в SEO-описании",
+            desc_len,
+            delta="В норме (800–1200)" if is_desc_ok else "Вне нормы (800–1200)",
+            delta_color="normal" if is_desc_ok else "inverse",
+        )
         col_st3.metric("Время ответа", f"{meta.duration_seconds} c")
 
         if meta.fallback_used:
             st.warning("⚠️ Использован резервный маршрут (fallback).")
 
         # 1. SEO Title
-        st.subheader("1. SEO-заголовок")
-        st.text_input("SEO-заголовок", value=card.seo_title, label_visibility="collapsed", disabled=True)
+        st.subheader("1. SEO-заголовок (нередактируемый блок с копированием)")
+        st.code(card.seo_title, language=None)
         st.caption(f"Длина: {len(card.seo_title)} из 70 символов.")
 
         # 2. SEO Description
-        st.subheader("2. SEO-описание")
-        desc_len = len(card.seo_description)
-        is_desc_ok = 800 <= desc_len <= 1200
-        desc_badge = "✅ В пределах нормы (800–1200)" if is_desc_ok else "⚠️ Отклонение от нормы (800–1200)"
-        st.markdown(f"**Объем:** `{desc_len}` знаков с пробелами — {desc_badge}")
-        st.text_area("SEO-описание", value=card.seo_description, height=180, label_visibility="collapsed", disabled=True)
+        st.subheader("2. SEO-описание (нередактируемый блок с копированием)")
+        if is_desc_ok:
+            st.markdown(
+                f"**Объем:** **{desc_len}** знаков с пробелами — "
+                f":green[**✅ В пределах нормы (800–1200 символов)**]"
+            )
+        else:
+            st.markdown(
+                f"**Объем:** **{desc_len}** знаков с пробелами — "
+                f":red[**⚠️ Отклонение от нормы (требуется от 800 до 1200 символов)**]"
+            )
+        st.code(card.seo_description, language=None)
 
         # 3. Specs List
-        st.subheader("3. Характеристики (сформированы программно)")
+        st.subheader("3. Характеристики (сформированы программно из входа)")
         specs_table_data = [{"Характеристика": item.name, "Значение": item.value} for item in card.specs_list]
         st.table(specs_table_data)
 
@@ -339,30 +379,35 @@ def main() -> None:
         st.subheader("5. Commercial-блок")
         st.info(card.commercial_block)
 
-        # Экспорт в JSON и Markdown
+        # Экспорт в JSON и Markdown и переход к следующему запросу
         st.subheader("Экспорт")
-        col_exp1, col_exp2 = st.columns(2)
+        col_exp1, col_exp2, col_exp3 = st.columns([2, 2, 2])
 
         export_json_str = card_payload.model_dump_json(indent=2)
         export_md_str = format_markdown_export(card_payload)
 
         with col_exp1:
             st.download_button(
-                label="📥 Скачать результат в JSON",
+                label="📥 Скачать JSON",
                 data=export_json_str,
                 file_name="product_card.json",
                 mime="application/json",
-                use_container_width=True,
+                width="stretch",
             )
 
         with col_exp2:
             st.download_button(
-                label="📥 Скачать результат в Markdown",
+                label="📥 Скачать Markdown",
                 data=export_md_str,
                 file_name="product_card.md",
                 mime="text/markdown",
-                use_container_width=True,
+                width="stretch",
             )
+
+        with col_exp3:
+            if st.button("➕ Новая карточка товара", width="stretch", type="secondary", help="Очистить форму и перейти к следующему прибору"):
+                clear_form()
+                st.rerun()
 
 
 if __name__ == "__main__":

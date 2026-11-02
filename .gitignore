@@ -38,3 +38,26 @@ htmlcov/
 
 # Streamlit
 .streamlit/
+
+# IDE & Editor caches
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Agent & AI tool caches
+.claude/
+.agents/
+.gemini/
+
+# Temporary generated files
+output.json
+output.md
+
+# Original employer assignment (keep locally)
+/Тестовое задание_ AI-разработчик.pdf
+/SPEC.md
